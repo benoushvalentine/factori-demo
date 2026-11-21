@@ -1,0 +1,108 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+model Retailer {
+  id        String @id
+  name      String
+  paused    Boolean @default(false)
+  customers Customer[]
+  products  Product[]
+  campaigns Campaign[]
+  connection WhatsAppConnection?
+}
+model Customer {
+  id         String @id
+  retailerId String
+  retailer   Retailer @relation(fields: [retailerId], references: [id])
+  name       String
+  phone      String
+  nickname   String
+  language   String
+  languageOverride Boolean @default(false)
+  style      String
+  consent    Boolean @default(true)
+  takeover   Boolean @default(false)
+  profile    Json
+  purchases  Json
+  lastContacted DateTime?
+  messages   Message[]
+  changes    PreferenceChange[]
+  drafts     Draft[]
+  @@unique([retailerId, phone])
+}
+model Product {
+  id         String @id
+  retailerId String
+  retailer   Retailer @relation(fields: [retailerId], references: [id])
+  name       String
+  description String
+  category   String
+  price      Int
+  colors     Json
+  sizes      Json
+  stock      Int
+  image      String
+  url        String
+  style      String
+}
+model Campaign {
+  id         String @id @default(cuid())
+  retailerId String
+  retailer   Retailer @relation(fields: [retailerId], references: [id])
+  name       String
+  createdAt  DateTime @default(now())
+  drafts     Draft[]
+}
+model Draft {
+  id         String @id @default(cuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  text       String
+  productIds Json
+  reasons    Json
+  status     String @default("pending")
+  sentAt     DateTime?
+  @@unique([campaignId, customerId])
+}
+model Message {
+  id         String @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  direction  String
+  text       String
+  status     String
+  origin     String @default("live")
+  language   String
+  intent     String?
+  campaignId String?
+  createdAt  DateTime @default(now())
+}
+model PreferenceChange {
+  id         String @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  field      String
+  before     Json
+  after      Json
+  source     String
+  confidence Float
+  createdAt  DateTime @default(now())
+}
+
+model WhatsAppConnection {
+  retailerId String @id
+  retailer Retailer @relation(fields: [retailerId], references: [id], onDelete: Cascade)
+  status String @default("disconnected")
+  startedAt DateTime?
+  connectedAt DateTime?
+  syncedAt DateTime?
+  contactsSynced Int @default(0)
+  historiesSynced Int @default(0)
+  importedContacts Int @default(0)
+}

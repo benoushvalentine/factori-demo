@@ -917,3 +917,83 @@ test("reply-processing failure reports delivered messages and can retry without 
     1,
   );
 });
+
+test("sales autopilot runs both sides, learns size, records one demo order and can safely retry", async () => {
+  const contact = await request(
+    "/api/customers",
+    "POST",
+    { name: "Sales Demo", phone: "+919000077777", language: "English" },
+    201,
+  );
+  await request(`/api/customers/${contact.id}`, "PATCH", { consent: true });
+  const campaign = await request(
+    "/api/campaigns",
+    "POST",
+    { name: "Automatic sale", customerIds: [contact.id] },
+    201,
+  );
+  await request(`/api/campaigns/${campaign.id}/approve`, "POST");
+  const sent = await request(`/api/campaigns/${campaign.id}/send`, "POST", {
+    simulateToSale: true,
+  });
+  assert.equal(sent.sent, 1);
+  assert.equal(sent.simulationStarted, true);
+  let draft: any;
+  for (let i = 0; i < 100; i++) {
+    draft = await db.draft.findUniqueOrThrow({
+      where: { id: campaign.drafts[0].id },
+    });
+    if (draft.salesSimulationStatus !== "running") break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(draft.salesSimulationStatus, "completed");
+  const updated = await db.customer.findUniqueOrThrow({
+    where: { id: contact.id },
+  });
+  assert.ok((updated.profile as any).preferred_size.value);
+  assert.match((updated.profile as any).last_purchase.value, /simulated/);
+  assert.equal((updated.purchases as any[]).length, 1);
+  assert.equal((updated.purchases as any[])[0].simulated, true);
+  const messages = await db.message.findMany({
+    where: { campaignId: campaign.id },
+  });
+  assert.ok(messages.filter((m) => m.direction === "incoming").length >= 3);
+  assert.ok(
+    messages.filter(
+      (m) => m.direction === "outgoing" && m.status === "simulated",
+    ).length >= 3,
+  );
+  assert.equal(messages.filter((m) => m.status === "pending").length, 0);
+  assert.match(
+    messages.find((m) => m.id.startsWith("sales-receipt:"))!.text,
+    /demo/i,
+  );
+  await request(`/api/campaigns/${campaign.id}/simulate-sale`, "POST");
+  assert.equal(
+    (await db.customer.findUniqueOrThrow({ where: { id: contact.id } }))
+      .purchases instanceof Array,
+    true,
+  );
+  assert.equal(
+    (
+      (await db.customer.findUniqueOrThrow({ where: { id: contact.id } }))
+        .purchases as any[]
+    ).length,
+    1,
+  );
+  await request("/api/retailer", "PATCH", { paused: true });
+  const blocked = await request(
+    "/api/campaigns",
+    "POST",
+    { name: "Paused sale", customerIds: [contact.id] },
+    201,
+  );
+  await request(`/api/campaigns/${blocked.id}/approve`, "POST");
+  await request(
+    `/api/campaigns/${blocked.id}/send`,
+    "POST",
+    { simulateToSale: true },
+    409,
+  );
+  await request("/api/retailer", "PATCH", { paused: false });
+});

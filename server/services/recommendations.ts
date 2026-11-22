@@ -16,6 +16,10 @@ export function recommend(customer: CustomerData, catalogue: ProductData[]) {
     .filter(
       (product) =>
         product.stock > 0 &&
+        (!p.preferred_size?.value ||
+          (product.sizes as string[]).includes(
+            String(p.preferred_size.value),
+          )) &&
         product.price <= budget &&
         !dislikes.some((d) =>
           `${product.name} ${product.category} ${product.style} ${(product.colors as string[]).join(" ")}`

@@ -304,3 +304,91 @@ export async function retailerReply(
     return fallback;
   return result.message;
 }
+
+const salesDecisionSchema = z.object({
+  message: z.string().trim().min(1).max(1800),
+  confirmed: z.boolean(),
+  productId: z.string().nullable(),
+});
+export async function salesCustomerTurn(
+  customer: CustomerData,
+  history: unknown,
+  products: {
+    product: { id: string; name: string; price: number; sizes: unknown };
+  }[],
+  stage: "size" | "purchase",
+) {
+  const product = products[0]?.product;
+  if (!product) return { message: "", confirmed: false, productId: null };
+  const available = product.sizes as string[];
+  const remembered = String(
+    (customer.profile as Profile).preferred_size?.value || "",
+  );
+  const size = available.includes(remembered)
+    ? remembered
+    : available.includes("M")
+      ? "M"
+      : available[0] || "";
+  const price = `₹${product.price.toLocaleString("en-IN")}`;
+  const fallback =
+    stage === "size"
+      ? customer.language === "Tamil"
+        ? `${size} size venum.`
+        : customer.language === "Kannada"
+          ? `Nanage ${size} size beku.`
+          : `I usually wear size ${size}.`
+      : customer.language === "Tamil"
+        ? `Sari, ${product.name} ${size} size-la ${price}-ku eduthukkaren. Order note pannunga.`
+        : customer.language === "Kannada"
+          ? `Sari, ${product.name} ${size} size ${price}-ge tegedukoltini. Order note maadi.`
+          : `Yes, I’ll take the ${product.name} in size ${size} at ${price}. Please note my order.`;
+  const result = await generate(
+    `Simulate ONE fictional customer's next WhatsApp reply in their preferred language using Latin letters. Both participants are AI and all sales are simulated. Continue naturally from the history, no repeated greetings. ${stage === "size" ? "Answer the retailer question and explicitly share an available size. Do NOT confirm a purchase yet: confirmed=false,productId=null." : "Choose one supplied, available product that fits the stated budget and size, and explicitly confirm you want to buy it. Set confirmed=true and productId to that exact supplied ID only if your message explicitly confirms that choice. Never claim payment occurred. If none fits, do not confirm."} Return {message,confirmed,productId}. Do not invent product facts or personal relationships.`,
+    {
+      language: customer.language,
+      memory: customer.profile,
+      history,
+      eligibleProducts: products,
+    },
+    salesDecisionSchema,
+  );
+  if (
+    result &&
+    latin(result.message) &&
+    (stage === "size" ||
+      !result.confirmed ||
+      products.some((p) => p.product.id === result.productId))
+  )
+    return result;
+  return {
+    message: fallback,
+    confirmed: stage === "purchase",
+    productId: stage === "purchase" ? product.id : null,
+  };
+}
+export async function salesReceipt(
+  customer: CustomerData,
+  product: { name: string; price: number },
+  size: string,
+) {
+  const price = `₹${product.price.toLocaleString("en-IN")}`;
+  const fallback =
+    customer.language === "Tamil"
+      ? `Sari, ${product.name}, ${size} size note pannitten. Total ${price}. Demo order dhaan; payment edhuvum pannala.`
+      : customer.language === "Kannada"
+        ? `Sari, ${product.name}, ${size} size note maadiddene. Total ${price}. Idu demo order; payment aagilla.`
+        : `Noted: ${product.name}, size ${size}, ${price}. Demo order recorded—no payment has been taken.`;
+  const result = await generate(
+    "Write a brief natural retailer acknowledgement of this already-recorded SIMULATED order, in the customer language using Latin letters. Include the supplied product, size and exact price, and a clear demo-order marker. Do not ask another sales question or claim payment, shipment or real delivery. Return {message}.",
+    { language: customer.language, product, size },
+    messageSchema,
+  );
+  return result &&
+    latin(result.message) &&
+    /demo|simulat/i.test(result.message) &&
+    result.message.includes(product.name) &&
+    result.message.includes(String(product.price)) &&
+    result.message.includes(size)
+    ? result.message
+    : fallback;
+}

@@ -149,6 +149,7 @@ const labels: Record<string, string> = {
   disliked_items: "Avoid",
   purchase_intent: "Purchase intent",
   preferred_size: "Size",
+  last_purchase: "Last demo order",
   communication_style: "Communication style",
   preferred_language: "Language",
 };
@@ -342,6 +343,25 @@ export default function App() {
     window.addEventListener("hashchange", listener);
     return () => window.removeEventListener("hashchange", listener);
   }, []);
+  const simulating = data?.campaigns.some((c) =>
+    c.drafts.some((d) => d.salesSimulationStatus === "running"),
+  );
+  useEffect(() => {
+    if (!simulating) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        if (active) await refresh();
+      } catch {}
+    };
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [simulating, refresh]);
   const previousConnection = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!data) return;
@@ -2390,7 +2410,19 @@ function Campaigns({
               <h2>{campaign.name}</h2>
               <p>
                 {campaign.drafts.length} customers · Created{" "}
-                {date(campaign.createdAt)} · {sent} simulated deliveries
+                {date(campaign.createdAt)} · {sent} simulated deliveries ·{" "}
+                {
+                  campaign.drafts.filter(
+                    (d) => d.salesSimulationStatus === "running",
+                  ).length
+                }{" "}
+                AI conversations running ·{" "}
+                {
+                  campaign.drafts.filter(
+                    (d) => d.salesSimulationStatus === "completed",
+                  ).length
+                }{" "}
+                demo sales
               </p>
             </div>
             <div className="button-group">
@@ -2409,6 +2441,31 @@ function Campaigns({
                 <CheckCheck size={17} />
                 Approve all pending
               </button>
+              {campaign.drafts.some(
+                (d) =>
+                  d.status === "sent" &&
+                  !["completed", "no_match", "declined", "running"].includes(
+                    d.salesSimulationStatus || "not_started",
+                  ),
+              ) && (
+                <button
+                  className="button"
+                  disabled={
+                    busy ||
+                    data.retailer.paused ||
+                    data.connection?.status !== "connected"
+                  }
+                  onClick={() =>
+                    void run(
+                      () =>
+                        api(`/campaigns/${campaign.id}/simulate-sale`, "POST"),
+                      "Both AI participants are continuing toward a demo sale.",
+                    )
+                  }
+                >
+                  <Play size={17} /> Simulate to sale / resume
+                </button>
+              )}
               {campaign.drafts.some(
                 (d) =>
                   d.status === "sent" &&
@@ -2440,13 +2497,16 @@ function Campaigns({
                 }
                 onClick={() =>
                   void run(
-                    () => api(`/campaigns/${campaign.id}/send`, "POST"),
-                    `${approved} approved message${approved === 1 ? "" : "s"} sent. Customer replies and preference updates simulated automatically.`,
+                    () =>
+                      api(`/campaigns/${campaign.id}/send`, "POST", {
+                        simulateToSale: true,
+                      }),
+                    `${approved} approved message${approved === 1 ? "" : "s"} sent. AI sales conversations started; memory and demo orders update automatically.`,
                   )
                 }
               >
                 <Send size={17} />
-                Send approved ({approved})
+                Send & simulate to sale ({approved})
               </button>
             </div>
           </section>
@@ -2455,7 +2515,9 @@ function Campaigns({
             <span>
               Review every recommendation and message. Editing a message resets
               its approval. Only approved messages are sent through the
-              simulator.
+              simulator. After you start the sales demo, both AI participants
+              continue automatically. All orders are simulated; no payment is
+              taken.
             </span>
           </div>
           <div className="draft-grid">
@@ -2483,8 +2545,8 @@ function Campaigns({
                 <h3>The conversation is just getting started.</h3>
                 <p>
                   Customer replies and preference updates run automatically.
-                  Open conversations to review their responses and pending
-                  follow-ups.
+                  Open conversations to watch both AI participants chat, learn
+                  preferences and record a demo order.
                 </p>
               </div>
               <button
@@ -2562,6 +2624,22 @@ function DraftCard({
               : d.status}
         </Badge>
       </div>
+      {d.salesSimulationStatus && d.salesSimulationStatus !== "not_started" && (
+        <p className="notice">
+          {(
+            {
+              running:
+                "AI conversation in progress — memory updates automatically",
+              completed: "Demo sale confirmed — order and memory saved",
+              paused:
+                "Simulation paused — check connection, consent or takeover, then resume",
+              failed: "Simulation interrupted — resume to retry",
+              no_match: "Stopped: no available product matches the customer",
+              declined: "Customer did not confirm a demo purchase",
+            } as Record<string, string>
+          )[d.salesSimulationStatus] || d.salesSimulationStatus}
+        </p>
+      )}
       <div className="draft-products">
         {selectedProducts.map((p) => (
           <div className="recommendation-product" key={p.id}>
@@ -2855,7 +2933,8 @@ function Conversations({
           <div className="chat-safety-strip">
             <ShieldCheck size={13} />
             <span>
-              Automatic simulated customer replies · AI replies require approval
+              AI sales demo runs both sides automatically · Memory updates as
+              they chat · No real orders or payments
             </span>
             {c.takeover && <Badge tone="amber">Manual takeover</Badge>}
             {!c.consent && <Badge tone="red">Marketing stopped</Badge>}
@@ -2977,6 +3056,7 @@ function Conversations({
                 "preferred_style",
                 "purchase_intent",
                 "preferred_size",
+                "last_purchase",
               ].map(
                 (f) =>
                   c.profile[f] && (

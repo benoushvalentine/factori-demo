@@ -3,6 +3,8 @@ import { connectionService } from "./services/connection.js";
 import { introduction, hasDemoOptIn } from "./services/introduction.js";
 import express from "express";
 import {
+  salesCustomerTurn,
+  salesReceipt,
   geminiStatus,
   customerReply,
   analyzeReply,
@@ -428,7 +430,7 @@ app.post("/api/campaigns/:id/send", async (req, res) => {
       d.status === "sent" &&
       ["pending", "failed"].includes(d.automaticReplyStatus),
   );
-  if (!approved.length && !retryable) {
+  if (!approved.length && !retryable && !req.body?.simulateToSale) {
     res.json({ sent: 0, automaticReplies: 0, automaticReplyFailures: 0 });
     return;
   }
@@ -484,6 +486,11 @@ app.post("/api/campaigns/:id/send", async (req, res) => {
         }
       }),
     );
+  if (req.body?.simulateToSale === true) {
+    await startSalesSimulation(c.id);
+    res.json({ sent: approved.length, simulationStarted: true });
+    return;
+  }
   try {
     const result = await processCampaignReplies(c.id);
     res.json({ sent: approved.length, ...result });
@@ -501,6 +508,263 @@ app.post("/api/campaigns/:id/send", async (req, res) => {
     });
   }
 });
+// Bounded, persisted demo autopilot. Model calls run outside SQLite transactions.
+const salesJobs = new Map<string, Promise<void>>();
+const customerSalesJobs = new Map<string, Promise<void>>();
+async function salesGuard(customerId: string) {
+  const c = await customer(customerId);
+  checkSending(await retailer(), c);
+  await requireWhatsAppConnection();
+  return c;
+}
+async function runSalesSimulation(draftId: string) {
+  const draft = await db.draft.findUniqueOrThrow({ where: { id: draftId } });
+  const campaignId = draft.campaignId;
+  const setStatus = (
+    salesSimulationStatus: string,
+    salesSimulationTurn?: number,
+  ) =>
+    serializeDatabaseWrite(() =>
+      db.draft.update({
+        where: { id: draftId },
+        data: {
+          salesSimulationStatus,
+          ...(salesSimulationTurn === undefined ? {} : { salesSimulationTurn }),
+        },
+      }),
+    );
+  const history = (c: Awaited<ReturnType<typeof customer>>) =>
+    c.messages
+      .filter((m) => m.status !== "pending" && m.status !== "rejected")
+      .slice(-12)
+      .map((m) => ({
+        role: m.direction === "incoming" ? "customer" : "retailer",
+        text: m.text,
+      }));
+  try {
+    await salesGuard(draft.customerId);
+    const alreadyPurchased = (await customer(draft.customerId)).purchases as {
+      simulationId?: string;
+    }[];
+    if (alreadyPurchased.some((p) => p.simulationId === draftId)) {
+      await setStatus("completed", 3);
+      return;
+    }
+    const response = await db.message.findFirst({
+      where: {
+        customerId: draft.customerId,
+        campaignId,
+        direction: "incoming",
+        createdAt: { gte: draft.sentAt! },
+      },
+    });
+    if (!response) await automaticCustomerTurn(draft.customerId, campaignId);
+    await serializeDatabaseWrite(() =>
+      db.draft.update({
+        where: { id: draftId },
+        data: { automaticReplyStatus: "processed", salesSimulationTurn: 1 },
+      }),
+    );
+    for (const stage of ["size", "purchase"] as const) {
+      let c = await salesGuard(draft.customerId);
+      if (
+        stage === "size" &&
+        (await db.message.findUnique({
+          where: { id: `sales-size:${draftId}` },
+        }))
+      )
+        continue;
+      let recs = ai.recommend(c, await catalogue());
+      if (!recs.length) {
+        await setStatus("no_match");
+        return;
+      }
+      // Only show a single actual offer, so customer confirmation cannot pick an unseen item.
+      const pending = await db.message.findFirst({
+        where: {
+          customerId: c.id,
+          campaignId,
+          status: "pending",
+          direction: "outgoing",
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (pending)
+        await serializeDatabaseWrite(async () => {
+          const fresh = await salesGuard(c.id);
+          await simulatedWhatsApp.deliver({
+            phone: fresh.phone,
+            text: pending.text,
+          });
+          await db.$transaction([
+            db.message.update({
+              where: { id: pending.id },
+              data: { status: "simulated" },
+            }),
+            db.customer.update({
+              where: { id: c.id },
+              data: { lastContacted: new Date() },
+            }),
+          ]);
+        });
+      c = await salesGuard(c.id);
+      recs = ai.recommend(c, await catalogue());
+      const offered = recs.find((r) => pending?.text.includes(r.product.name));
+      recs = offered ? [offered] : recs.slice(0, 1);
+      const decision = await salesCustomerTurn(c, history(c), recs, stage);
+      await salesGuard(c.id);
+      const incomingId = `sales-${stage}:${draftId}`;
+      if (!(await db.message.findUnique({ where: { id: incomingId } })))
+        await processIncoming(
+          c.id,
+          decision.message,
+          campaignId,
+          stage === "size",
+          incomingId,
+        );
+      await setStatus("running", stage === "size" ? 2 : 3);
+      if (stage === "size") continue;
+      c = await salesGuard(c.id);
+      const chosen = ai
+        .recommend(c, await catalogue())
+        .find((r) => r.product.id === decision.productId)?.product;
+      if (!decision.confirmed || !chosen) {
+        await setStatus("declined");
+        return;
+      }
+      const size = String((c.profile as Profile).preferred_size?.value || "");
+      if (!(chosen.sizes as string[]).includes(size)) {
+        await setStatus("no_match");
+        return;
+      }
+      const receipt = await salesReceipt(c, chosen, size);
+      await serializeDatabaseWrite(async () => {
+        const fresh = await salesGuard(c.id);
+        const valid = ai
+          .recommend(fresh, await catalogue())
+          .some((r) => r.product.id === chosen.id);
+        if (!valid)
+          throw new HttpError(
+            409,
+            "The product no longer matches this customer.",
+          );
+        await simulatedWhatsApp.deliver({ phone: fresh.phone, text: receipt });
+        await db.$transaction(async (tx) => {
+          const current = await tx.customer.findUniqueOrThrow({
+            where: { id: c.id },
+          });
+          const purchases = current.purchases as { simulationId?: string }[];
+          if (purchases.some((p) => p.simulationId === draftId)) return;
+          const profile = current.profile as Profile;
+          const value = `${chosen.name}, size ${size}, ₹${chosen.price} (simulated)`;
+          await tx.customer.update({
+            where: { id: c.id },
+            data: {
+              purchases: json([
+                ...purchases,
+                {
+                  productId: chosen.id,
+                  name: chosen.name,
+                  price: chosen.price,
+                  size,
+                  date: new Date().toISOString(),
+                  campaignId,
+                  simulated: true,
+                  simulationId: draftId,
+                },
+              ]),
+              profile: json({
+                ...profile,
+                last_purchase: fact(
+                  value,
+                  "Simulated order confirmed in conversation",
+                  true,
+                  1,
+                ),
+              }),
+              lastContacted: new Date(),
+            },
+          });
+          await tx.preferenceChange.create({
+            data: {
+              customerId: c.id,
+              field: "last_purchase",
+              before: json(profile.last_purchase?.value ?? null),
+              after: value,
+              source: `Simulated customer confirmation: ${decision.message}`,
+              confidence: 1,
+            },
+          });
+          await tx.message.create({
+            data: {
+              id: `sales-receipt:${draftId}`,
+              customerId: c.id,
+              campaignId,
+              direction: "outgoing",
+              status: "simulated",
+              language: c.language,
+              text: receipt,
+              intent: "Simulated sale",
+            },
+          });
+          await tx.draft.update({
+            where: { id: draftId },
+            data: {
+              salesSimulationStatus: "completed",
+              salesSimulationTurn: 3,
+            },
+          });
+        });
+      });
+    }
+  } catch (error) {
+    console.error("Sales simulation stopped", { draftId }, error);
+    await setStatus(error instanceof HttpError ? "paused" : "failed").catch(
+      () => {},
+    );
+  }
+}
+async function startSalesSimulation(campaignId: string) {
+  const c = await campaign(campaignId);
+  const drafts = c.drafts.filter(
+    (d) =>
+      d.status === "sent" &&
+      !["completed", "no_match", "declined"].includes(d.salesSimulationStatus),
+  );
+  for (const draft of drafts) {
+    if (salesJobs.has(draft.id)) continue;
+    await salesGuard(draft.customerId);
+    await serializeDatabaseWrite(() =>
+      db.draft.update({
+        where: { id: draft.id },
+        data: { salesSimulationStatus: "running" },
+      }),
+    );
+    const before = customerSalesJobs.get(draft.customerId) || Promise.resolve();
+    const job = before.catch(() => {}).then(() => runSalesSimulation(draft.id));
+    salesJobs.set(draft.id, job);
+    customerSalesJobs.set(draft.customerId, job);
+    void job.finally(() => {
+      salesJobs.delete(draft.id);
+      if (customerSalesJobs.get(draft.customerId) === job)
+        customerSalesJobs.delete(draft.customerId);
+    });
+  }
+}
+export async function resumeSalesSimulations() {
+  const drafts = await db.draft.findMany({
+    where: {
+      salesSimulationStatus: "running",
+      campaign: { retailerId: RETAILER_ID },
+    },
+  });
+  for (const id of new Set(drafts.map((d) => d.campaignId)))
+    await startSalesSimulation(id).catch(console.error);
+}
+app.post("/api/campaigns/:id/simulate-sale", async (req, res) => {
+  await startSalesSimulation(req.params.id);
+  res.json({ simulationStarted: true });
+});
 const replyJobs = new Map<string, Promise<void>>();
 async function processCampaignReplies(campaignId: string) {
   const pending = await db.draft.findMany({
@@ -508,6 +772,7 @@ async function processCampaignReplies(campaignId: string) {
       campaignId,
       status: "sent",
       automaticReplyStatus: { in: ["pending", "failed"] },
+      salesSimulationStatus: "not_started",
     },
   });
   const outcomes = await Promise.allSettled(
@@ -740,10 +1005,18 @@ async function processIncoming(
   customerId: string,
   text: string,
   campaignId?: string,
+  generateReply = true,
+  incomingId?: string,
 ) {
   const c = await customer(customerId),
     store = await retailer();
   const interpretation = await analyzeReply(text, c);
+  // An order total is not a new maximum budget.
+  if (
+    incomingId?.startsWith("sales-purchase:") &&
+    !/budget|within|under|maximum|olage|kulla/i.test(text)
+  )
+    delete interpretation.updates.budget_max;
   const detected = interpretation.detected;
   const language = c.languageOverride ? c.language : detected.language;
   const style = detected.confidence >= 0.7 ? interpretation.style : c.style;
@@ -778,6 +1051,7 @@ async function processIncoming(
       }
       await tx.message.create({
         data: {
+          ...(incomingId ? { id: incomingId } : {}),
           customerId: c.id,
           direction: "incoming",
           text,
@@ -824,6 +1098,7 @@ async function processIncoming(
     }),
   );
   if (
+    generateReply &&
     !interpretation.deletion &&
     !interpretation.optout &&
     c.consent &&

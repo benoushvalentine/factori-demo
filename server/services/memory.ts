@@ -26,6 +26,10 @@ export function interpret(text: string, previous: Profile) {
     ]),
   ];
   let intent = "Unclear";
+  const size =
+    text.match(/\bsize\s*(?:is\s*)?(XXL|XL|S|M|L)\b/i) ||
+    text.match(/\b(XXL|XL|S|M|L)\s+size\b/i);
+  if (size) set("preferred_size", size[1].toUpperCase());
   const optout =
     /\b(stop|unsubscribe|opt out|do not message|don't message|no more messages)\b/i.test(
       text,

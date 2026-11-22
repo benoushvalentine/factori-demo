@@ -47,6 +47,19 @@ export function generateFollowup(
         ? "Neevu kelida thara option iga sigalilla. Bere style nodona?"
         : "I couldn’t find an available option that fits. Would you like to try another style?";
   }
+  const size = String(
+    (customer.profile as import("../types.js").Profile).preferred_size?.value ||
+      "",
+  );
+  if (size && /\bsize\b/i.test(context.text)) {
+    const p = recommendations[0].product;
+    const price = `₹${p.price.toLocaleString("en-IN")}`;
+    return tamil
+      ? `Sari, ${size} size irukku. ${p.name} ${price}. Idha order note pannalama?`
+      : kannada
+        ? `Sari, ${size} size ide. ${p.name} ${price}. Order note maadona?`
+        : `Size ${size} is available for the ${p.name} at ${price}. Shall I note your order?`;
+  }
   const pastelRequested = /\bpastel\b/i.test(context.text);
   const selected =
     (pastelRequested &&

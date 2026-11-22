@@ -68,6 +68,8 @@ model Draft {
   reasons    Json
   status     String @default("pending")
   automaticReplyStatus String @default("pending")
+  salesSimulationStatus String @default("not_started")
+  salesSimulationTurn Int @default(0)
   sentAt     DateTime?
   @@unique([campaignId, customerId])
 }

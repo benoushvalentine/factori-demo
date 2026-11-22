@@ -62,6 +62,8 @@ export type Product = {
   style: string;
 };
 export type Draft = {
+  salesSimulationStatus?: string;
+  salesSimulationTurn?: number;
   automaticReplyStatus?: "pending" | "processed" | "failed" | "skipped";
   id: string;
   customerId: string;

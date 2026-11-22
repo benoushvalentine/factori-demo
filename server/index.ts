@@ -1,7 +1,7 @@
 import express from "express";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import app from "./app.js";
+import app, { resumeSalesSimulations } from "./app.js";
 import { db } from "./db.js";
 const dist = path.resolve("dist");
 if (existsSync(dist)) {
@@ -12,11 +12,12 @@ if (existsSync(dist)) {
 }
 const port = Number(process.env.PORT || 3001);
 const host = process.env.HOST || "127.0.0.1";
-const server = app.listen(port, host, () =>
+const server = app.listen(port, host, () => {
+  void resumeSalesSimulations().catch(console.error);
   console.log(
     `Factori API${existsSync(dist) ? " + app" : ""}: http://${host}:${port}`,
-  ),
-);
+  );
+});
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.once(signal, () =>
     server.close(() => {

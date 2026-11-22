@@ -514,7 +514,12 @@ const customerSalesJobs = new Map<string, Promise<void>>();
 async function salesGuard(customerId: string) {
   const c = await customer(customerId);
   checkSending(await retailer(), c);
-  await requireWhatsAppConnection();
+  // Read only: connection synchronisation may itself acquire the writer queue.
+  const connection = await db.whatsAppConnection.findUnique({
+    where: { retailerId: RETAILER_ID },
+  });
+  if (connection?.status !== "connected")
+    throw new HttpError(409, "Connect the WhatsApp demo before continuing.");
   return c;
 }
 async function runSalesSimulation(draftId: string) {

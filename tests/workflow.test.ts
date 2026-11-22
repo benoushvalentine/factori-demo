@@ -754,3 +754,166 @@ test("zero-history introductions require permission, learn preferences, and reco
     400,
   );
 });
+
+test("SQLite write queue serializes concurrent transactions and recovers after a failure", async () => {
+  const { serializeDatabaseWrite } = await import("../server/db.js");
+  let active = 0,
+    maxActive = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const first = serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await tx.retailer.update({
+        where: { id: "style-studio" },
+        data: { paused: false },
+      });
+      started();
+      await barrier;
+      active--;
+    }),
+  );
+  await ready;
+  const second = serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await tx.retailer.update({
+        where: { id: "style-studio" },
+        data: { paused: false },
+      });
+      active--;
+    }),
+  );
+  release();
+  await Promise.all([first, second]);
+  assert.equal(maxActive, 1);
+  await assert.rejects(
+    serializeDatabaseWrite(async () => {
+      throw new Error("Expected write failure");
+    }),
+  );
+  assert.equal(await serializeDatabaseWrite(async () => 42), 42);
+});
+
+test("multi-customer replies complete without concurrent SQLite write transactions", async () => {
+  const workspace = await request("/api/workspace");
+  const ids = workspace.customers
+    .filter((c: any) => c.consent && !c.takeover)
+    .slice(0, 10)
+    .map((c: any) => c.id);
+  assert.ok(ids.length >= 5);
+  const campaign = await request(
+    "/api/campaigns",
+    "POST",
+    { name: "Parallel customer regression", customerIds: ids },
+    201,
+  );
+  await request(`/api/campaigns/${campaign.id}/approve`, "POST");
+  const sent = await request(`/api/campaigns/${campaign.id}/send`, "POST");
+  assert.equal(sent.sent, ids.length);
+  assert.equal(sent.automaticReplies, ids.length);
+  assert.equal(sent.automaticReplyFailures, 0);
+  const updated = (await request("/api/workspace")).campaigns.find(
+    (c: any) => c.id === campaign.id,
+  );
+  assert.ok(
+    updated.drafts.every(
+      (d: any) => d.status === "sent" && d.automaticReplyStatus === "processed",
+    ),
+  );
+  const replies = await db.message.count({
+    where: { campaignId: campaign.id, direction: "incoming" },
+  });
+  assert.equal(replies, ids.length);
+  assert.equal(
+    (await request(`/api/campaigns/${campaign.id}/send`, "POST")).sent,
+    0,
+  );
+  assert.equal(
+    await db.message.count({
+      where: { campaignId: campaign.id, direction: "incoming" },
+    }),
+    replies,
+  );
+});
+
+test("reply-processing failure reports delivered messages and can retry without resending", async () => {
+  const contact = await request(
+    "/api/customers",
+    "POST",
+    { name: "Recovery Demo", phone: "+919000088888", language: "English" },
+    201,
+  );
+  await request(`/api/customers/${contact.id}`, "PATCH", { consent: true });
+  const campaign = await request(
+    "/api/campaigns",
+    "POST",
+    { name: "Reply recovery regression", customerIds: [contact.id] },
+    201,
+  );
+  await request(`/api/campaigns/${campaign.id}/approve`, "POST");
+  const original = db.$transaction.bind(db);
+  let count = 0;
+  db.$transaction = ((...args: any[]) => {
+    if (typeof args[0] === "function" && ++count === 2)
+      throw new Error("Simulated P1008 memory transaction timeout");
+    return (original as any)(...args);
+  }) as typeof db.$transaction;
+  try {
+    const result = await request(`/api/campaigns/${campaign.id}/send`, "POST");
+    assert.equal(result.sent, 1);
+    assert.equal(result.automaticReplyFailures, 1);
+    assert.match(result.warning, /messages were sent/i);
+  } finally {
+    db.$transaction = original as typeof db.$transaction;
+  }
+  assert.equal(
+    await db.message.count({
+      where: {
+        customerId: contact.id,
+        direction: "outgoing",
+        status: "simulated",
+      },
+    }),
+    1,
+  );
+  const failed = await db.draft.findUniqueOrThrow({
+    where: { id: campaign.drafts[0].id },
+  });
+  assert.equal(failed.automaticReplyStatus, "failed");
+  const recovery = await request(`/api/campaigns/${campaign.id}/send`, "POST");
+  assert.equal(recovery.sent, 0);
+  assert.equal(recovery.automaticReplies, 1);
+  assert.equal(recovery.automaticReplyFailures, 0);
+  assert.equal(
+    await db.message.count({
+      where: {
+        customerId: contact.id,
+        direction: "outgoing",
+        status: "simulated",
+      },
+    }),
+    1,
+  );
+  assert.equal(
+    await db.message.count({
+      where: { customerId: contact.id, direction: "incoming" },
+    }),
+    1,
+  );
+  await request(`/api/campaigns/${campaign.id}/send`, "POST");
+  assert.equal(
+    await db.message.count({
+      where: { customerId: contact.id, direction: "incoming" },
+    }),
+    1,
+  );
+});

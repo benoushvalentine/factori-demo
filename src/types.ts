@@ -62,6 +62,7 @@ export type Product = {
   style: string;
 };
 export type Draft = {
+  automaticReplyStatus?: "pending" | "processed" | "failed" | "skipped";
   id: string;
   customerId: string;
   text: string;

@@ -1,5 +1,5 @@
 import { Prisma } from "@prisma/client";
-import { db } from "../db.js";
+import { db, serializeDatabaseWrite } from "../db.js";
 import {
   simulatedWhatsApp,
   type WhatsAppAdapter,
@@ -65,11 +65,13 @@ export class WhatsAppConnectionService {
       importedContacts: 0,
     };
     return this.view(
-      await db.whatsAppConnection.upsert({
-        where: { retailerId },
-        create: { retailerId, ...data },
-        update: data,
-      }),
+      await serializeDatabaseWrite(() =>
+        db.whatsAppConnection.upsert({
+          where: { retailerId },
+          create: { retailerId, ...data },
+          update: data,
+        }),
+      ),
     );
   }
   async disconnect(retailerId: string) {
@@ -77,86 +79,92 @@ export class WhatsAppConnectionService {
     await this.provider.disconnect(retailerId);
     const data = { status: "disconnected", startedAt: null, connectedAt: null };
     return this.view(
-      await db.whatsAppConnection.upsert({
-        where: { retailerId },
-        create: { retailerId, ...data },
-        update: data,
-      }),
+      await serializeDatabaseWrite(() =>
+        db.whatsAppConnection.upsert({
+          where: { retailerId },
+          create: { retailerId, ...data },
+          update: data,
+        }),
+      ),
     );
   }
   private async advance(retailerId: string, startedAt: Date) {
     const status = await this.provider.pollPairing(retailerId, startedAt);
     if (status !== "connected")
-      return db.whatsAppConnection.update({
-        where: { retailerId },
-        data: { status },
-      });
+      return serializeDatabaseWrite(() =>
+        db.whatsAppConnection.update({
+          where: { retailerId },
+          data: { status },
+        }),
+      );
     const payload = await this.provider.syncContacts(retailerId);
-    return db.$transaction(async (tx) => {
-      const existing = await tx.customer.findMany({ where: { retailerId } });
-      const ids = new Map<string, string>();
-      let importedContacts = 0;
-      for (const contact of payload.contacts) {
-        let customer = existing.find(
-          (c) => digits(c.phone) === digits(contact.phone),
-        );
-        if (!customer) {
-          customer = await tx.customer.create({
-            data: {
-              id: `${retailerId}:whatsapp:${contact.key}`,
-              retailerId,
-              name: contact.name,
-              nickname: contact.nickname,
-              phone: contact.phone,
-              language: contact.language,
-              style: contact.style,
-              consent: contact.consent,
-              profile: contact.profile as Prisma.InputJsonValue,
-              purchases: [],
+    return serializeDatabaseWrite(() =>
+      db.$transaction(async (tx) => {
+        const existing = await tx.customer.findMany({ where: { retailerId } });
+        const ids = new Map<string, string>();
+        let importedContacts = 0;
+        for (const contact of payload.contacts) {
+          let customer = existing.find(
+            (c) => digits(c.phone) === digits(contact.phone),
+          );
+          if (!customer) {
+            customer = await tx.customer.create({
+              data: {
+                id: `${retailerId}:whatsapp:${contact.key}`,
+                retailerId,
+                name: contact.name,
+                nickname: contact.nickname,
+                phone: contact.phone,
+                language: contact.language,
+                style: contact.style,
+                consent: contact.consent,
+                profile: contact.profile as Prisma.InputJsonValue,
+                purchases: [],
+              },
+            });
+            importedContacts++;
+          }
+          ids.set(contact.key, customer.id);
+        }
+        for (const [index, message] of payload.histories.entries()) {
+          const customerId = ids.get(message.contactKey);
+          if (!customerId) continue;
+          const found = await tx.message.findFirst({
+            where: {
+              customerId,
+              text: message.text,
+              direction: message.direction,
             },
           });
-          importedContacts++;
+          if (!found)
+            await tx.message.create({
+              data: {
+                customerId,
+                direction: message.direction,
+                text: message.text,
+                language: message.language,
+                status:
+                  message.direction === "outgoing" ? "simulated" : "received",
+                origin: "seed",
+                createdAt: new Date(
+                  Date.now() - (payload.histories.length - index) * 3600000,
+                ),
+              },
+            });
         }
-        ids.set(contact.key, customer.id);
-      }
-      for (const [index, message] of payload.histories.entries()) {
-        const customerId = ids.get(message.contactKey);
-        if (!customerId) continue;
-        const found = await tx.message.findFirst({
-          where: {
-            customerId,
-            text: message.text,
-            direction: message.direction,
+        return tx.whatsAppConnection.update({
+          where: { retailerId },
+          data: {
+            status: "connected",
+            connectedAt: new Date(),
+            syncedAt: new Date(),
+            contactsSynced: payload.contacts.length,
+            historiesSynced: payload.histories.length,
+            importedContacts,
           },
         });
-        if (!found)
-          await tx.message.create({
-            data: {
-              customerId,
-              direction: message.direction,
-              text: message.text,
-              language: message.language,
-              status:
-                message.direction === "outgoing" ? "simulated" : "received",
-              origin: "seed",
-              createdAt: new Date(
-                Date.now() - (payload.histories.length - index) * 3600000,
-              ),
-            },
-          });
-      }
-      return tx.whatsAppConnection.update({
-        where: { retailerId },
-        data: {
-          status: "connected",
-          connectedAt: new Date(),
-          syncedAt: new Date(),
-          contactsSynced: payload.contacts.length,
-          historiesSynced: payload.histories.length,
-          importedContacts,
-        },
-      });
-    });
+      }),
+    );
   }
 }
 export const connectionService = new WhatsAppConnectionService(

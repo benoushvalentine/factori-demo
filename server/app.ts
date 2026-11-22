@@ -11,7 +11,7 @@ import {
 } from "./adapters/gemini.js";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
-import { db, RETAILER_ID } from "./db.js";
+import { db, RETAILER_ID, serializeDatabaseWrite } from "./db.js";
 import { seed } from "../prisma/seed.js";
 import { fact, simulatedAI as ai, simulatedWhatsApp } from "./intelligence.js";
 import type { Profile, ProductData } from "./types.js";
@@ -142,7 +142,11 @@ function checkSending(
     );
 }
 app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, mode: "local-demo" }),
+  res.json({
+    ok: true,
+    mode: "local-demo",
+    version: process.env.RENDER_GIT_COMMIT || "local",
+  }),
 );
 app.get("/api/workspace", async (_req, res) => {
   const [store, customers, products, campaigns, detectedTone] =
@@ -240,20 +244,22 @@ app.post("/api/customers", async (req, res) => {
     )
   )
     throw new HttpError(409, "This contact is already in your workspace.");
-  const created = await db.customer.create({
-    data: {
-      id: randomUUID(),
-      retailerId: RETAILER_ID,
-      name: input.name,
-      nickname: input.name.split(" ")[0],
-      phone,
-      language: input.language,
-      style: "Respectful",
-      consent: false,
-      profile: {},
-      purchases: [],
-    },
-  });
+  const created = await serializeDatabaseWrite(() =>
+    db.customer.create({
+      data: {
+        id: randomUUID(),
+        retailerId: RETAILER_ID,
+        name: input.name,
+        nickname: input.name.split(" ")[0],
+        phone,
+        language: input.language,
+        style: "Respectful",
+        consent: false,
+        profile: {},
+        purchases: [],
+      },
+    }),
+  );
   res.status(201).json(await customer(created.id));
 });
 app.get("/api/customers/:id/introduction", async (req, res) => {
@@ -281,22 +287,24 @@ app.post("/api/customers/:id/introduction", async (req, res) => {
     );
   await requireWhatsAppConnection();
   const delivery = await simulatedWhatsApp.deliver({ phone: c.phone, text });
-  await db.$transaction([
-    db.message.create({
-      data: {
-        customerId: c.id,
-        direction: "outgoing",
-        text,
-        status: delivery.status,
-        language: c.language,
-        origin: "first-contact",
-      },
-    }),
-    db.customer.update({
-      where: { id: c.id },
-      data: { lastContacted: new Date() },
-    }),
-  ]);
+  await serializeDatabaseWrite(() =>
+    db.$transaction([
+      db.message.create({
+        data: {
+          customerId: c.id,
+          direction: "outgoing",
+          text,
+          status: delivery.status,
+          language: c.language,
+          origin: "first-contact",
+        },
+      }),
+      db.customer.update({
+        where: { id: c.id },
+        data: { lastContacted: new Date() },
+      }),
+    ]),
+  );
   const fallback =
     c.language === "Tamil"
       ? "Seri, anuppunga! Casual wear venum, budget 1000 kulla."
@@ -311,22 +319,24 @@ app.post("/api/customers/:id/introduction", async (req, res) => {
     "introduction",
   );
   const consentGranted = hasDemoOptIn(reply);
-  await db.$transaction([
-    db.customer.update({
-      where: { id: c.id },
-      data: { consent: consentGranted },
-    }),
-    db.preferenceChange.create({
-      data: {
-        customerId: c.id,
-        field: "marketing_consent",
-        before: c.consent,
-        after: consentGranted,
-        source: `Simulated customer reply: ${reply}`,
-        confidence: 1,
-      },
-    }),
-  ]);
+  await serializeDatabaseWrite(() =>
+    db.$transaction([
+      db.customer.update({
+        where: { id: c.id },
+        data: { consent: consentGranted },
+      }),
+      db.preferenceChange.create({
+        data: {
+          customerId: c.id,
+          field: "marketing_consent",
+          before: c.consent,
+          after: consentGranted,
+          source: `Simulated customer reply: ${reply}`,
+          confidence: 1,
+        },
+      }),
+    ]),
+  );
   await processIncoming(c.id, reply);
   res.json({ customer: await customer(c.id), consentGranted });
 });
@@ -350,26 +360,28 @@ app.post("/api/campaigns", async (req, res) => {
       409,
       "Only customers with marketing consent can join a campaign.",
     );
-  const created = await db.campaign.create({
-    data: {
-      retailerId: RETAILER_ID,
-      name: input.name,
-      drafts: {
-        create: customers.map((c) => {
-          const recs = ai.recommend(c, products);
-          return {
-            customerId: c.id,
-            text: ai.generateMessage(c, recs, detectedTone),
-            productIds: recs.map((r) => r.product.id),
-            reasons: recs.map(
-              (r) => `${r.product.name}: ${r.reasons.join("; ")}`,
-            ),
-          };
-        }),
+  const created = await serializeDatabaseWrite(() =>
+    db.campaign.create({
+      data: {
+        retailerId: RETAILER_ID,
+        name: input.name,
+        drafts: {
+          create: customers.map((c) => {
+            const recs = ai.recommend(c, products);
+            return {
+              customerId: c.id,
+              text: ai.generateMessage(c, recs, detectedTone),
+              productIds: recs.map((r) => r.product.id),
+              reasons: recs.map(
+                (r) => `${r.product.name}: ${r.reasons.join("; ")}`,
+              ),
+            };
+          }),
+        },
       },
-    },
-    include: { drafts: true },
-  });
+      include: { drafts: true },
+    }),
+  );
   res.status(201).json(created);
 });
 app.patch("/api/drafts/:id", async (req, res) => {
@@ -387,31 +399,40 @@ app.patch("/api/drafts/:id", async (req, res) => {
   if (!draft) throw new HttpError(404, "Draft not found.");
   if (draft.status === "sent")
     throw new HttpError(409, "Sent messages cannot be edited.");
-  const updated = await db.draft.update({
-    where: { id: draft.id },
-    data: {
-      ...input,
-      status: input.text !== undefined ? "pending" : input.status,
-    },
-  });
+  const updated = await serializeDatabaseWrite(() =>
+    db.draft.update({
+      where: { id: draft.id },
+      data: {
+        ...input,
+        status: input.text !== undefined ? "pending" : input.status,
+      },
+    }),
+  );
   res.json(updated);
 });
 app.post("/api/campaigns/:id/approve", async (req, res) => {
   const c = await campaign(req.params.id);
-  await db.draft.updateMany({
-    where: { campaignId: c.id, status: "pending" },
-    data: { status: "approved" },
-  });
+  await serializeDatabaseWrite(() =>
+    db.draft.updateMany({
+      where: { campaignId: c.id, status: "pending" },
+      data: { status: "approved" },
+    }),
+  );
   res.json(await campaign(c.id));
 });
 app.post("/api/campaigns/:id/send", async (req, res) => {
   const c = await campaign(req.params.id);
   const approved = c.drafts.filter((d) => d.status === "approved");
-  if (!approved.length) {
-    res.json({ sent: 0 });
+  const retryable = c.drafts.some(
+    (d) =>
+      d.status === "sent" &&
+      ["pending", "failed"].includes(d.automaticReplyStatus),
+  );
+  if (!approved.length && !retryable) {
+    res.json({ sent: 0, automaticReplies: 0, automaticReplyFailures: 0 });
     return;
   }
-  await requireWhatsAppConnection();
+  if (approved.length) await requireWhatsAppConnection();
   const store = await retailer(),
     products = await catalogue();
   const customers = await Promise.all(
@@ -430,42 +451,134 @@ app.post("/api/campaigns/:id/send", async (req, res) => {
         );
     }
   }
-  await db.$transaction(async (tx) => {
-    for (const [i, draft] of approved.entries()) {
-      const delivery = await simulatedWhatsApp.deliver({
-        phone: customers[i].phone,
-        text: draft.text,
-      });
-      await tx.message.create({
-        data: {
-          customerId: draft.customerId,
-          text: draft.text,
-          direction: "outgoing",
-          status: delivery.status,
-          language: customers[i].language,
-          campaignId: c.id,
-        },
-      });
-      await tx.draft.update({
-        where: { id: draft.id },
-        data: { status: "sent", sentAt: new Date() },
-      });
-      await tx.customer.update({
-        where: { id: draft.customerId },
-        data: { lastContacted: new Date() },
-      });
-    }
+  if (approved.length)
+    await serializeDatabaseWrite(() =>
+      db.$transaction(async (tx) => {
+        for (const [i, draft] of approved.entries()) {
+          const delivery = await simulatedWhatsApp.deliver({
+            phone: customers[i].phone,
+            text: draft.text,
+          });
+          await tx.message.create({
+            data: {
+              customerId: draft.customerId,
+              text: draft.text,
+              direction: "outgoing",
+              status: delivery.status,
+              language: customers[i].language,
+              campaignId: c.id,
+            },
+          });
+          await tx.draft.update({
+            where: { id: draft.id },
+            data: {
+              status: "sent",
+              sentAt: new Date(),
+              automaticReplyStatus: "pending",
+            },
+          });
+          await tx.customer.update({
+            where: { id: draft.customerId },
+            data: { lastContacted: new Date() },
+          });
+        }
+      }),
+    );
+  try {
+    const result = await processCampaignReplies(c.id);
+    res.json({ sent: approved.length, ...result });
+  } catch (error) {
+    console.error(
+      "Campaign reply processing unavailable",
+      { campaignId: c.id },
+      error,
+    );
+    res.json({
+      sent: approved.length,
+      automaticReplies: 0,
+      warning:
+        "Campaign messages were already sent. Customer reply processing is unavailable; use Retry customer replies without resending the campaign.",
+    });
+  }
+});
+const replyJobs = new Map<string, Promise<void>>();
+async function processCampaignReplies(campaignId: string) {
+  const pending = await db.draft.findMany({
+    where: {
+      campaignId,
+      status: "sent",
+      automaticReplyStatus: { in: ["pending", "failed"] },
+    },
   });
-  // One automatic customer turn per newly delivered campaign message. Repeated
-  // sends have no approved drafts, so they cannot duplicate customer replies.
-  await Promise.all(
-    customers.map(async (contact) => {
-      await automaticCustomerTurn(contact.id);
+  const outcomes = await Promise.allSettled(
+    pending.map(async (draft) => {
+      let job = replyJobs.get(draft.id);
+      if (!job) {
+        job = (async () => {
+          const contact = await customer(draft.customerId);
+          if (!contact.consent) {
+            await serializeDatabaseWrite(() =>
+              db.draft.update({
+                where: { id: draft.id },
+                data: { automaticReplyStatus: "skipped" },
+              }),
+            );
+            return;
+          }
+          // Legacy sent campaigns may already have a response. Recover failed jobs
+          // without manufacturing duplicate incoming messages or preference changes.
+          const response = await db.message.findFirst({
+            where: {
+              customerId: draft.customerId,
+              direction: "incoming",
+              createdAt: { gte: draft.sentAt! },
+            },
+          });
+          if (!response)
+            await automaticCustomerTurn(draft.customerId, campaignId);
+          await serializeDatabaseWrite(() =>
+            db.draft.update({
+              where: { id: draft.id },
+              data: { automaticReplyStatus: "processed" },
+            }),
+          );
+        })();
+        replyJobs.set(draft.id, job);
+      }
+      try {
+        await job;
+      } catch (error) {
+        console.error(
+          "Automatic customer reply failed",
+          { campaignId, customerId: draft.customerId },
+          error,
+        );
+        await serializeDatabaseWrite(() =>
+          db.draft.update({
+            where: { id: draft.id },
+            data: { automaticReplyStatus: "failed" },
+          }),
+        ).catch((statusError) =>
+          console.error("Reply status could not be saved", statusError),
+        );
+        throw error;
+      } finally {
+        if (replyJobs.get(draft.id) === job) replyJobs.delete(draft.id);
+      }
     }),
   );
-  res.json({ sent: approved.length, automaticReplies: customers.length });
-});
-async function automaticCustomerTurn(id: string) {
+  const failed = outcomes.filter((r) => r.status === "rejected").length;
+  return {
+    automaticReplies: outcomes.length - failed,
+    automaticReplyFailures: failed,
+    ...(failed
+      ? {
+          warning: `Campaign messages were sent, but ${failed} customer reply update(s) failed. Use Retry customer replies; campaign messages will not be sent again.`,
+        }
+      : {}),
+  };
+}
+async function automaticCustomerTurn(id: string, campaignId?: string) {
   const contact = await customer(id);
   const fallback =
     contact.id === "ananya"
@@ -485,7 +598,7 @@ async function automaticCustomerTurn(id: string) {
     (m) => m.direction === "incoming" && m.origin !== "seed",
   );
   const text = await customerReply(contact, history, fallback, firstTurn);
-  await processIncoming(id, text);
+  await processIncoming(id, text, campaignId);
 }
 const profileInput = z
   .object({
@@ -532,82 +645,88 @@ app.patch("/api/customers/:id", async (req, res) => {
   }
   if (rest.language && rest.languageOverride === undefined)
     rest.languageOverride = true;
-  const result = await db.$transaction(async (tx) => {
-    for (const [field, value] of Object.entries(edits ?? {})) {
-      const previous = p[field]?.value ?? null;
-      p[field] = fact(value!, "Retailer correction");
-      await tx.preferenceChange.create({
-        data: {
-          customerId: c.id,
-          field,
-          before: json(previous),
-          after: json(value),
-          source: "Retailer correction",
-          confidence: 1,
-        },
+  const result = await serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      for (const [field, value] of Object.entries(edits ?? {})) {
+        const previous = p[field]?.value ?? null;
+        p[field] = fact(value!, "Retailer correction");
+        await tx.preferenceChange.create({
+          data: {
+            customerId: c.id,
+            field,
+            before: json(previous),
+            after: json(value),
+            source: "Retailer correction",
+            confidence: 1,
+          },
+        });
+      }
+      const updated = await tx.customer.update({
+        where: { id: c.id },
+        data: { ...rest, profile: json(p) },
       });
-    }
-    const updated = await tx.customer.update({
-      where: { id: c.id },
-      data: { ...rest, profile: json(p) },
-    });
-    // A saved consent change or correction invalidates unsent campaign recommendations and followups.
-    if (edits || input.language || input.consent === false) {
-      await tx.draft.updateMany({
-        where: { customerId: c.id, status: { in: ["pending", "approved"] } },
-        data: { status: "rejected" },
-      });
-      await tx.message.updateMany({
-        where: { customerId: c.id, status: "pending" },
-        data: { status: "rejected" },
-      });
-    }
-    return updated;
-  });
+      // A saved consent change or correction invalidates unsent campaign recommendations and followups.
+      if (edits || input.language || input.consent === false) {
+        await tx.draft.updateMany({
+          where: { customerId: c.id, status: { in: ["pending", "approved"] } },
+          data: { status: "rejected" },
+        });
+        await tx.message.updateMany({
+          where: { customerId: c.id, status: "pending" },
+          data: { status: "rejected" },
+        });
+      }
+      return updated;
+    }),
+  );
   res.json(result);
 });
 app.delete("/api/customers/:id/memory", async (req, res) => {
   const c = await customer(req.params.id);
-  await db.$transaction([
-    db.preferenceChange.deleteMany({ where: { customerId: c.id } }),
-    db.customer.update({
-      where: { id: c.id },
-      data: {
-        profile: {},
-        language: "English",
-        languageOverride: false,
-        style: "Concise",
-      },
-    }),
-    db.draft.updateMany({
-      where: { customerId: c.id, status: { in: ["pending", "approved"] } },
-      data: { status: "rejected" },
-    }),
-    db.message.updateMany({
-      where: { customerId: c.id, status: "pending" },
-      data: { status: "rejected" },
-    }),
-  ]);
+  await serializeDatabaseWrite(() =>
+    db.$transaction([
+      db.preferenceChange.deleteMany({ where: { customerId: c.id } }),
+      db.customer.update({
+        where: { id: c.id },
+        data: {
+          profile: {},
+          language: "English",
+          languageOverride: false,
+          style: "Concise",
+        },
+      }),
+      db.draft.updateMany({
+        where: { customerId: c.id, status: { in: ["pending", "approved"] } },
+        data: { status: "rejected" },
+      }),
+      db.message.updateMany({
+        where: { customerId: c.id, status: "pending" },
+        data: { status: "rejected" },
+      }),
+    ]),
+  );
   res.json({ ok: true });
 });
 app.delete("/api/customers/:id/history", async (req, res) => {
   const c = await customer(req.params.id);
-  await db.$transaction([
-    db.preferenceChange.deleteMany({ where: { customerId: c.id } }),
-    db.message.deleteMany({ where: { customerId: c.id } }),
-    db.draft.deleteMany({ where: { customerId: c.id } }),
-    db.customer.update({
-      where: { id: c.id },
-      data: {
-        profile: {},
-        purchases: [],
-        lastContacted: null,
-        language: "English",
-        languageOverride: false,
-        style: "Concise",
-      },
-    }),
-  ]);
+  await serializeDatabaseWrite(() =>
+    db.$transaction([
+      db.preferenceChange.deleteMany({ where: { customerId: c.id } }),
+      db.message.deleteMany({ where: { customerId: c.id } }),
+      db.draft.deleteMany({ where: { customerId: c.id } }),
+      db.customer.update({
+        where: { id: c.id },
+        data: {
+          profile: {},
+          purchases: [],
+          lastContacted: null,
+          language: "English",
+          languageOverride: false,
+          style: "Concise",
+        },
+      }),
+    ]),
+  );
   res.json({ ok: true });
 });
 app.post("/api/customers/:id/incoming", async (req, res) => {
@@ -617,7 +736,11 @@ app.post("/api/customers/:id/incoming", async (req, res) => {
     .parse(req.body);
   res.json(await processIncoming(req.params.id, text));
 });
-async function processIncoming(customerId: string, text: string) {
+async function processIncoming(
+  customerId: string,
+  text: string,
+  campaignId?: string,
+) {
   const c = await customer(customerId),
     store = await retailer();
   const interpretation = await analyzeReply(text, c);
@@ -633,70 +756,73 @@ async function processIncoming(customerId: string, text: string) {
     ...(c.profile as Profile),
     ...interpretation.updates,
   };
-  const result = await db.$transaction(async (tx) => {
-    if (interpretation.deletion) {
-      await tx.preferenceChange.deleteMany({ where: { customerId: c.id } });
-      await tx.message.deleteMany({ where: { customerId: c.id } });
-      await tx.draft.deleteMany({ where: { customerId: c.id } });
+  const result = await serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      if (interpretation.deletion) {
+        await tx.preferenceChange.deleteMany({ where: { customerId: c.id } });
+        await tx.message.deleteMany({ where: { customerId: c.id } });
+        await tx.draft.deleteMany({ where: { customerId: c.id } });
+        const updated = await tx.customer.update({
+          where: { id: c.id },
+          data: {
+            profile: {},
+            purchases: [],
+            consent: false,
+            language: "English",
+            languageOverride: false,
+            style: "Concise",
+            lastContacted: null,
+          },
+        });
+        return { customer: updated, reply: null };
+      }
+      await tx.message.create({
+        data: {
+          customerId: c.id,
+          direction: "incoming",
+          text,
+          status: "received",
+          language: detected.language,
+          intent: interpretation.intent,
+          campaignId,
+        },
+      });
+      for (const [field, value] of changes)
+        await tx.preferenceChange.create({
+          data: {
+            customerId: c.id,
+            field,
+            before: json((c.profile as Profile)[field]?.value ?? null),
+            after: json(value.value),
+            source: `Customer message: ${text}`,
+            confidence: value.confidence,
+          },
+        });
       const updated = await tx.customer.update({
         where: { id: c.id },
         data: {
-          profile: {},
-          purchases: [],
-          consent: false,
-          language: "English",
-          languageOverride: false,
-          style: "Concise",
-          lastContacted: null,
+          profile: json(updatedProfile),
+          language,
+          style,
+          ...(interpretation.optout ? { consent: false } : {}),
         },
       });
-      return { customer: updated, reply: null };
-    }
-    await tx.message.create({
-      data: {
-        customerId: c.id,
-        direction: "incoming",
-        text,
-        status: "received",
-        language: detected.language,
-        intent: interpretation.intent,
-      },
-    });
-    for (const [field, value] of changes)
-      await tx.preferenceChange.create({
-        data: {
-          customerId: c.id,
-          field,
-          before: json((c.profile as Profile)[field]?.value ?? null),
-          after: json(value.value),
-          source: `Customer message: ${text}`,
-          confidence: value.confidence,
-        },
-      });
-    const updated = await tx.customer.update({
-      where: { id: c.id },
-      data: {
-        profile: json(updatedProfile),
-        language,
-        style,
-        ...(interpretation.optout ? { consent: false } : {}),
-      },
-    });
-    // Incoming feedback makes old unapproved follow-ups obsolete. New information also invalidates old campaign drafts.
-    await tx.message.updateMany({
-      where: { customerId: c.id, status: "pending" },
-      data: { status: "rejected" },
-    });
-    if (changes.length || interpretation.optout)
-      await tx.draft.updateMany({
-        where: { customerId: c.id, status: { in: ["pending", "approved"] } },
+      // Incoming feedback makes old unapproved follow-ups obsolete. New information also invalidates old campaign drafts.
+      await tx.message.updateMany({
+        where: { customerId: c.id, status: "pending" },
         data: { status: "rejected" },
       });
-    return {
-      customer: updated,
-      reply: null as Awaited<ReturnType<typeof tx.message.create>> | null,
-    };
-  });
+      if (changes.length || interpretation.optout)
+        await tx.draft.updateMany({
+          where: { customerId: c.id, status: { in: ["pending", "approved"] } },
+          data: { status: "rejected" },
+        });
+      return {
+        customer: updated,
+        reply: null as Awaited<ReturnType<typeof tx.message.create>> | null,
+      };
+    }),
+  );
   if (
     !interpretation.deletion &&
     !interpretation.optout &&
@@ -737,15 +863,18 @@ async function processIncoming(customerId: string, text: string) {
       await tone(),
       fallbackReply,
     );
-    result.reply = await db.message.create({
-      data: {
-        customerId: c.id,
-        direction: "outgoing",
-        text: replyText,
-        language,
-        status: "pending",
-      },
-    });
+    result.reply = await serializeDatabaseWrite(() =>
+      db.message.create({
+        data: {
+          customerId: c.id,
+          direction: "outgoing",
+          text: replyText,
+          language,
+          status: "pending",
+          campaignId,
+        },
+      }),
+    );
   }
   return {
     ...result,
@@ -787,20 +916,25 @@ app.patch("/api/messages/:id", async (req, res) => {
     checkSending(await retailer(), c);
     await simulatedWhatsApp.deliver({ phone: c.phone, text: message.text });
   }
-  const result = await db.$transaction(async (tx) => {
-    const updated = await tx.message.update({
-      where: { id: message.id },
-      data: input,
-    });
-    if (input.status === "simulated")
-      await tx.customer.update({
-        where: { id: message.customerId },
-        data: { lastContacted: new Date() },
+  const result = await serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      const updated = await tx.message.update({
+        where: { id: message.id },
+        data: input,
       });
-    return updated;
-  });
+      if (input.status === "simulated")
+        await tx.customer.update({
+          where: { id: message.customerId },
+          data: { lastContacted: new Date() },
+        });
+      return updated;
+    }),
+  );
   if (input.status === "simulated" && geminiEnabled())
-    await automaticCustomerTurn(message.customerId);
+    await automaticCustomerTurn(
+      message.customerId,
+      message.campaignId ?? undefined,
+    );
   res.json(result);
 });
 app.post("/api/customers/:id/manual", async (req, res) => {
@@ -821,26 +955,28 @@ app.post("/api/customers/:id/manual", async (req, res) => {
     );
   await requireWhatsAppConnection();
   const delivery = await simulatedWhatsApp.deliver({ phone: c.phone, text });
-  const message = await db.$transaction(async (tx) => {
-    await tx.message.updateMany({
-      where: { customerId: c.id, status: "pending" },
-      data: { status: "rejected" },
-    });
-    await tx.customer.update({
-      where: { id: c.id },
-      data: { lastContacted: new Date() },
-    });
-    return tx.message.create({
-      data: {
-        customerId: c.id,
-        direction: "outgoing",
-        text,
-        status: delivery.status,
-        language: ai.detectLanguage(text, c.language).language,
-        origin: "manual",
-      },
-    });
-  });
+  const message = await serializeDatabaseWrite(() =>
+    db.$transaction(async (tx) => {
+      await tx.message.updateMany({
+        where: { customerId: c.id, status: "pending" },
+        data: { status: "rejected" },
+      });
+      await tx.customer.update({
+        where: { id: c.id },
+        data: { lastContacted: new Date() },
+      });
+      return tx.message.create({
+        data: {
+          customerId: c.id,
+          direction: "outgoing",
+          text,
+          status: delivery.status,
+          language: ai.detectLanguage(text, c.language).language,
+          origin: "manual",
+        },
+      });
+    }),
+  );
   if (geminiEnabled()) await automaticCustomerTurn(c.id);
   res.status(201).json(message);
 });
@@ -878,20 +1014,24 @@ app.post("/api/customers/:id/convert", async (req, res) => {
       simulated: true,
     },
   ];
-  const updated = await db.customer.update({
-    where: { id: c.id },
-    data: { purchases },
-  });
+  const updated = await serializeDatabaseWrite(() =>
+    db.customer.update({
+      where: { id: c.id },
+      data: { purchases },
+    }),
+  );
   res.json(updated);
 });
 app.patch("/api/retailer", async (req, res) => {
   const input = z.object({ paused: z.boolean() }).strict().parse(req.body);
   res.json(
-    await db.retailer.update({ where: { id: RETAILER_ID }, data: input }),
+    await serializeDatabaseWrite(() =>
+      db.retailer.update({ where: { id: RETAILER_ID }, data: input }),
+    ),
   );
 });
 app.post("/api/reset", async (_req, res) => {
-  await seed();
+  await serializeDatabaseWrite(() => seed());
   res.json({ ok: true });
 });
 app.use("/api", (_req, res) =>

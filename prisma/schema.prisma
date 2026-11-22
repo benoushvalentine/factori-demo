@@ -67,6 +67,7 @@ model Draft {
   productIds Json
   reasons    Json
   status     String @default("pending")
+  automaticReplyStatus String @default("pending")
   sentAt     DateTime?
   @@unique([campaignId, customerId])
 }

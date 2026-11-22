@@ -386,9 +386,17 @@ export default function App() {
   const run: Run = async (fn, success) => {
     setBusy(true);
     try {
-      await fn();
+      const outcome = await fn();
       await refresh();
-      if (success)
+      const warning =
+        outcome &&
+        typeof outcome === "object" &&
+        "warning" in outcome &&
+        typeof outcome.warning === "string"
+          ? outcome.warning
+          : null;
+      if (warning) setToast({ text: warning, error: true });
+      else if (success)
         setToast({
           text: success,
           error: false,
@@ -2401,6 +2409,27 @@ function Campaigns({
                 <CheckCheck size={17} />
                 Approve all pending
               </button>
+              {campaign.drafts.some(
+                (d) =>
+                  d.status === "sent" &&
+                  ["pending", "failed"].includes(
+                    d.automaticReplyStatus || "pending",
+                  ),
+              ) && (
+                <button
+                  className="button"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(
+                      () => api(`/campaigns/${campaign.id}/send`, "POST"),
+                      "Customer replies processed. No campaign messages were resent.",
+                    )
+                  }
+                >
+                  <RotateCcw size={17} />
+                  Retry customer replies
+                </button>
+              )}
               <button
                 className="button primary"
                 disabled={
